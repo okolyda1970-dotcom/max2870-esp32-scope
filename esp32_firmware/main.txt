@@ -1,0 +1,353 @@
+#include <Arduino.h>
+#include <SPI.h>
+#include <cmath>
+#include <cstring> // Для memcpy
+#include "max2870_regs.h"
+
+// ============================================================
+// ПИНЫ
+// ============================================================
+#define ADF_SCK   6
+#define ADF_MOSI  7 
+#define ADF_CE    1
+#define ADF_LE    3
+#define MUX_PIN   5 
+#define STATUS_LED 10 
+
+// Глобальные структуры
+StructR0 tipDef_0;
+StructR1 tipDef_1;
+StructR2 tipDef_2;
+StructR3 tipDef_3;
+StructR4 tipDef_4;
+StructR5 tipDef_5;
+
+// ============================================================
+// БИНАРНЫЙ ПРОТОКОЛ УПРАВЛЕНИЯ (24 байта)
+// Совместим с EspConnection.java
+// ============================================================
+#define PACKET_HEADER 0xAA
+#define PACKET_SIZE   24
+
+#pragma pack(push, 1)
+struct CommandPacket {
+    uint8_t  header;         // 0: Must be 0xAA
+    float    frequency;      // 1-4: Base Frequency in MHz
+    uint8_t  cp_current;     // 5: Charge Pump Current Code (0-15)
+    uint8_t  pd_polarity;    // 6: Phase Detector Polarity (0=Neg, 1=Pos)
+    uint8_t  ldf_mode;       // 7: Lock Detect Mode (0=Frac-N, 1=Integer-N)
+    uint8_t  mux_out_sel;    // 8: MUX Output Select (Usually 6 for Digital LD)
+    uint8_t  band_scan_div;  // 9: Band Select Clock Divider Value
+    uint8_t  rf_div_select;  // 10: RF Divider Select (0xFF = Auto)
+    uint8_t  output_power;   // 11: Output Power Code (0-3)
+    uint8_t  aux_enable;     // 12: Auxiliary Output Enable (0/1)
+    uint8_t  vco_pd;         // 13: VCO Power Down (0/1)
+    uint8_t  abp_mode;       // 14: Advanced Band Pass Filter (0/1)
+    uint8_t  charge_cancel;  // 15: Charge Cancel Enable (0/1)
+    int16_t  tuning_step;    // 16-17: Fine Tuning Step (Signed Short)
+    uint8_t  ld_pin_mode;    // 18: LD Pin Function (00=Low, 01=DigLD, 10=AnaLD, 11=High)
+    uint8_t  reserved;       // 19: Reserved
+    uint32_t checksum;       // 20-23: Sum of bytes 0..19
+};
+#pragma pack(pop)
+
+CommandPacket currentCmd;
+bool packetValid = false;
+
+// Буфер для приема
+uint8_t rxBuf[PACKET_SIZE];
+uint8_t rxIdx = 0;
+
+// ============================================================
+// ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+// ============================================================
+
+void sendRegister(uint32_t reg) {
+  digitalWrite(ADF_LE, LOW);
+  SPI.transfer((reg >> 24) & 0xFF);
+  SPI.transfer((reg >> 16) & 0xFF);
+  SPI.transfer((reg >> 8)  & 0xFF);
+  SPI.transfer(reg & 0xFF);
+  digitalWrite(ADF_LE, HIGH);
+  delayMicroseconds(2);
+  digitalWrite(ADF_LE, LOW);
+}
+
+uint32_t calcChecksum(const uint8_t* data, size_t len) {
+    uint32_t s = 0;
+    for (size_t i = 0; i < len; i++) s += data[i];
+    return s;
+}
+
+// Инициализация дефолтными значениями (для старта)
+void defaultSet() {
+    tipDef_0.adres = 0;
+    tipDef_0.reserved = 0;
+
+    tipDef_1.adres = 0b001;
+    tipDef_1.fazeAdj = 0;
+    tipDef_1.reserved = 0;
+
+    tipDef_2.adres = 0b010;
+    tipDef_2.counterReset = 0;
+    tipDef_2.CP_freeState = 0;
+    tipDef_2.powerDown = 0;
+    tipDef_2.PD_polarity = 0;      
+    tipDef_2.ldp = 1;
+    tipDef_2.ldf = 0;              
+    tipDef_2.chargePumpCurrent = 4; 
+    tipDef_2.doubleBufferR4 = 0;   
+    tipDef_2.R_counter = 1;        
+    tipDef_2.Rdiv2 = 0;            
+    tipDef_2.referenceDoubler = 0; 
+    tipDef_2.muxOut = 6;           
+    tipDef_2.noiseMode = 0;
+    tipDef_2.reserved = 0;
+
+    tipDef_3.adres = 0b011;
+    tipDef_3.clockDividerValue = 0;
+    tipDef_3.CLK_divMode = 0;
+    tipDef_3.reserved3 = 0;
+    tipDef_3.CSR = 0;
+    tipDef_3.reserved2 = 0;
+    tipDef_3.chargeCancel = 1; // Recommended ON
+    tipDef_3.ABP = 0;
+    tipDef_3.bandSelect = 1;       
+    tipDef_3.reserved = 0;
+
+    tipDef_4.adres = 0b100;
+    tipDef_4.outputPower = 3;      
+    tipDef_4.RFoutputEnable = 1;   
+    tipDef_4.AUXoutputPower = 0;
+    tipDef_4.AUXoutputEnable = 0;
+    tipDef_4.AUXoutputSelect = 0;
+    tipDef_4.MTLD = 0;             
+    tipDef_4.VCOpowerDown = 0;
+    tipDef_4.bandSelectclockDividerValue = 200; 
+    tipDef_4.RFdividerSelect = 0b010; // Default /4
+    tipDef_4.FBselect = 1;         
+    tipDef_4.reserved = 0;
+
+    tipDef_5.adres = 0b101;
+    tipDef_5.reserved4 = 0;
+    tipDef_5.reserved3 = 0b11;
+    tipDef_5.reserved2 = 0;
+    tipDef_5.LDpinMode = 0b01;     // Digital Lock Detect
+    tipDef_5.reserved = 0;
+}
+
+// Применение настроек из пакета
+bool applyFromPacket(const CommandPacket& cmd) {
+    // 1. Статические параметры чипа
+    tipDef_2.chargePumpCurrent = cmd.cp_current;
+    tipDef_2.PD_polarity       = cmd.pd_polarity;
+    tipDef_2.ldf               = cmd.ldf_mode;
+    tipDef_2.muxOut            = cmd.mux_out_sel;
+
+    tipDef_4.bandSelectclockDividerValue = cmd.band_scan_div;
+    tipDef_4.outputPower                 = cmd.output_power;
+    tipDef_4.AUXoutputEnable             = cmd.aux_enable;
+    tipDef_4.VCOpowerDown                = cmd.vco_pd;
+
+    tipDef_3.ABP           = cmd.abp_mode;
+    tipDef_3.chargeCancel  = cmd.charge_cancel;
+
+    // ВАЖНО: Обновляем режим вывода LD (R5 bits 23:22)
+    tipDef_5.LDpinMode = cmd.ld_pin_mode;
+
+    // 2. Выбор делителя выхода (RF divider)
+    float freqMHz = cmd.frequency;
+    uint8_t range = 0;
+    uint32_t divCode = 0;
+
+    if (cmd.rf_div_select == 0xFF) {
+        // AUTO MODE
+        if      (freqMHz >= 23.5  && freqMHz < 46.875) { range = 128; divCode = 7; }
+        else if (freqMHz >= 46.875 && freqMHz < 93.75)  { range = 64;  divCode = 6; }
+        else if (freqMHz >= 93.75  && freqMHz < 187.5)  { range = 32;  divCode = 5; }
+        else if (freqMHz >= 187.5  && freqMHz < 375)    { range = 16;  divCode = 4; }
+        else if (freqMHz >= 375    && freqMHz < 750)    { range = 8;   divCode = 3; }
+        else if (freqMHz >= 750    && freqMHz < 1500)   { range = 4;   divCode = 2; }
+        else if (freqMHz >= 1500   && freqMHz < 3000)   { range = 2;   divCode = 1; }
+        else if (freqMHz >= 3000   && freqMHz <= 6000)  { range = 1;   divCode = 0; }
+        else {
+            Serial.println("ERR: Freq out of range");
+            return false;
+        }
+        tipDef_4.RFdividerSelect = divCode;
+    } else {
+        // MANUAL MODE
+        divCode = cmd.rf_div_select;
+        switch (divCode) {
+            case 7: range = 128; break;
+            case 6: range = 64;  break;
+            case 5: range = 32;  break;
+            case 4: range = 16;  break;
+            case 3: range = 8;   break;
+            case 2: range = 4;   break;
+            case 1: range = 2;   break;
+            case 0: range = 1;   break;
+            default:
+                Serial.println("ERR: Bad RF divider code");
+                return false;
+        }
+        tipDef_4.RFdividerSelect = divCode;
+    }
+
+    // 3. Расчет N (INT + FRAC/MOD) с учетом Tuning Step
+    float fVCO = freqMHz * (float)range;
+    float valueN = fVCO / 25.0f;   // PFD = 25 МГц
+
+    int intValue = (int)floorf(valueN);
+    float fracPart = valueN - (float)intValue;
+
+    const int MOD_VALUE = 4095;
+    int baseFrac = (int)(fracPart * (float)MOD_VALUE);
+
+    // Применяем тонкую подстройку
+    long totalFrac = (long)baseFrac + (long)cmd.tuning_step;
+
+    // Нормализуем в диапазон [0, MOD]
+    while (totalFrac < 0) {
+        intValue--;
+        totalFrac += MOD_VALUE;
+    }
+    while (totalFrac > MOD_VALUE) {
+        intValue++;
+        totalFrac -= MOD_VALUE;
+    }
+
+    if (intValue < 0 || intValue > 65535) {
+         Serial.println("ERR: INT overflow after tuning");
+         return false;
+    }
+
+    tipDef_0.integ        = (uint16_t)intValue;
+    tipDef_0.frac         = (uint16_t)totalFrac;
+    tipDef_1.modulsValue  = MOD_VALUE;
+    tipDef_1.prescaler    = 1;      // Fractional-N -> 8/9 prescaler
+    tipDef_1.phaseValue   = 0;
+
+    // Отладочный вывод реальной итоговой частоты
+    float actualFreq = ((float)intValue + (float)totalFrac / (float)MOD_VALUE) * 25.0f / (float)range;
+    Serial.printf("OK: Base=%.2f MHz, Tune=%+d, Div=/%u -> Actual=%.4f MHz\n",
+                  freqMHz, cmd.tuning_step, (unsigned)range, actualFreq);
+
+    // 4. Отправка регистров (дважды — для запуска VAS сканирования полос)
+    uint32_t r0 = initReg0();
+    uint32_t r1 = initReg1();
+    uint32_t r2 = initReg2();
+    uint32_t r3 = initReg3();
+    uint32_t r4 = initReg4();
+    uint32_t r5 = initReg5();
+
+    for (int i = 0; i < 2; i++) {
+        sendRegister(r5);
+        sendRegister(r4);
+        sendRegister(r3);
+        sendRegister(r2);
+        sendRegister(r1);
+        sendRegister(r0);
+        delay(20);
+    }
+    return true;
+}
+
+// Чтение входящих пакетов из Serial
+void pollSerialPacket() {
+    while (Serial.available()) {
+        uint8_t b = (uint8_t)Serial.read();
+
+        if (rxIdx == 0) {
+            if (b == PACKET_HEADER) {
+                rxBuf[0] = b;
+                rxIdx = 1;
+            }
+            continue;
+        }
+
+        rxBuf[rxIdx++] = b;
+
+        if (rxIdx == PACKET_SIZE) {
+            uint32_t calc = calcChecksum(rxBuf, PACKET_SIZE - 4);
+            uint32_t got;
+            memcpy(&got, rxBuf + 20, 4);
+
+            if (calc == got) {
+                memcpy(&currentCmd, rxBuf, sizeof(CommandPacket));
+                packetValid = true;
+                applyFromPacket(currentCmd);
+            } else {
+                Serial.printf("ERR: Checksum mismatch (calc=%lu, got=%lu)\n",
+                              (unsigned long)calc, (unsigned long)got);
+            }
+            rxIdx = 0; // сброс индекса для следующего пакета
+        }
+    }
+}
+
+// ============================================================
+// SETUP AND LOOP
+// ============================================================
+
+void setup() {
+  Serial.begin(115200);
+  delay(2000);
+  
+  pinMode(STATUS_LED, OUTPUT);
+  pinMode(MUX_PIN, INPUT_PULLDOWN); // Используем внутреннюю подтяжку вниз для стабильности
+  pinMode(ADF_CE, OUTPUT);
+  pinMode(ADF_LE, OUTPUT);
+  digitalWrite(ADF_CE, HIGH);    
+  digitalWrite(ADF_LE, LOW);
+  
+  SPI.begin(ADF_SCK, -1, ADF_MOSI, -1); 
+  SPI.setFrequency(1000000);
+  SPI.setDataMode(SPI_MODE0);
+  SPI.setBitOrder(MSBFIRST);
+
+  Serial.println("=== MAX2870 Controller Ready (Binary Protocol) ===");
+  
+  // Стартовая настройка
+  defaultSet();
+  
+  // Заполняем стартовый пакет (1000 МГц, тюнинг 0, дефолтные параметры)
+  memset(&currentCmd, 0, sizeof(CommandPacket));
+  currentCmd.header        = PACKET_HEADER;
+  currentCmd.frequency     = 1000.0f;
+  currentCmd.cp_current    = 4;
+  currentCmd.pd_polarity   = 0;
+  currentCmd.ldf_mode      = 0;
+  currentCmd.mux_out_sel   = 6;
+  currentCmd.band_scan_div = 200;
+  currentCmd.rf_div_select = 0xFF; // Auto
+  currentCmd.output_power  = 3;
+  currentCmd.aux_enable    = 0;
+  currentCmd.vco_pd        = 0;
+  currentCmd.abp_mode      = 0;
+  currentCmd.charge_cancel = 1;
+  currentCmd.tuning_step   = 0;
+  currentCmd.ld_pin_mode   = 1; // Digital LD
+  
+  applyFromPacket(currentCmd);
+  packetValid = true;
+}
+
+void loop() {
+  // 1. Индикация статуса блокировки
+  int muxState = digitalRead(MUX_PIN);
+  static unsigned long lastPrint = 0;
+  if (millis() - lastPrint > 1000) {
+    lastPrint = millis();
+    if (muxState == HIGH) {
+      Serial.print("."); 
+      digitalWrite(STATUS_LED, HIGH);
+    } else {
+      Serial.println("\nUNLOCKED");
+      digitalWrite(STATUS_LED, LOW);
+    }
+  }
+
+  // 2. Обработка входящих команд от Java
+  pollSerialPacket();
+}
