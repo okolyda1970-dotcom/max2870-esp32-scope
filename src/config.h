@@ -12,6 +12,7 @@
 #define MUX_PIN   5 
 #define STATUS_LED 10
 #define ADC_PIN   0 
+//#define ADC_PIN   4
 
 // --- PROTOCOL CONSTANTS ---
 #define PACKET_HEADER 0xAA

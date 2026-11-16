@@ -88,11 +88,38 @@ bool checkLockStatus() {
 #define SNAP_MAX 250
 static uint16_t snapBuf[SNAP_MAX];
 static uint8_t  snapPkt[2 + SNAP_MAX * 2];
-static uint32_t snapFs     = 40000;   // Гц внутри кадра
-static uint16_t snapN      = 250;     // точек в кадре
-static uint16_t snapPeriod = 100;     // мс между кадрами
+static uint32_t snapFs     = 14000;
+static uint16_t snapN      = 250;
+static uint16_t snapPeriod = 100;
 static bool     scopeOn    = false;
 static unsigned long lastFrameMs = 0;
+
+static uint32_t adcUsPerSample = 56;
+
+static void measureAdcSpeed() {
+  uint32_t t = micros();
+  for (int i = 0; i < 100; i++) analogRead(ADC_PIN);
+  uint32_t d = micros() - t;
+  adcUsPerSample = d / 100;
+  if (adcUsPerSample == 0) adcUsPerSample = 1;
+}
+
+static void sendFrameChunked(const uint8_t* p, int len) {
+  if (!Serial) return;
+  int sent = 0;
+  uint32_t t0 = millis();
+  while (sent < len && (millis() - t0) < 200) {
+    int space = Serial.availableForWrite();
+    if (space > 0) {
+      int n = len - sent;
+      if (n > space) n = space;
+      Serial.write(p + sent, n);
+      sent += n;
+    } else {
+      delay(1);
+    }
+  }
+}
 
 static void captureFrame() {
   uint32_t interval = 1000000UL / snapFs;
@@ -107,20 +134,38 @@ static void captureFrame() {
     snapPkt[2 + i * 2]     = snapBuf[i] & 0xFF;
     snapPkt[2 + i * 2 + 1] = (snapBuf[i] >> 8) & 0xFF;
   }
-  int len = 2 + snapN * 2;
-  if (Serial.availableForWrite() >= len) Serial.write(snapPkt, len);  // иначе кадр пропускаем, не блокируемся
+  sendFrameChunked(snapPkt, 2 + snapN * 2);
 }
 
-// ================= SWEEP =================
-#define SWEEP_SETTLE_MS  25
-#define SWEEP_MEASURE_MS 20
-#define SWEEP_IF_HZ      200.0f
+// ================= SWEEP (Goertzel — частотно-избирательный) =================
+#define SWEEP_SETTLE_MS   25
+#define SWEEP_MEAS_FS     8000
+#define SWEEP_MEAS_N      64
+#define SWEEP_IF_HZ       200.0f
+
 static bool sweepActive = false;
-static uint8_t sweepPhase = 0;
+static uint8_t sweepPhase = 0;              // 0 = пауза на захват, 1 = замер
 static float sweepCur = 0, sweepStopF = 0, sweepStep = 0;
 static unsigned long sweepPhaseStart = 0;
-static int sweepMin = 0, sweepMax = 0;
+static uint16_t measBuf[SWEEP_MEAS_N];
+static uint16_t measIdx = 0;
+static uint32_t measNextUs = 0;
 static float bestF = 0; static int bestL = -1;
+
+static int goertzelLevel() {
+  uint32_t sum = 0;
+  for (int i = 0; i < SWEEP_MEAS_N; i++) sum += measBuf[i];
+  double mean = sum / (double)SWEEP_MEAS_N;
+  double coeff = 2.0 * cos(2.0 * PI * SWEEP_IF_HZ / SWEEP_MEAS_FS);
+  double s1 = 0, s2 = 0;
+  for (int i = 0; i < SWEEP_MEAS_N; i++) {
+    double s0 = (measBuf[i] - mean) + coeff * s1 - s2;
+    s2 = s1; s1 = s0;
+  }
+  double power = s1 * s1 + s2 * s2 - coeff * s1 * s2;
+  if (power < 0) power = 0;
+  return (int)(sqrt(power) * 2.0 / SWEEP_MEAS_N);
+}
 
 // ================= протокол =================
 static uint8_t rxBuf[CTRL_SIZE];
@@ -135,7 +180,7 @@ static void handlePacket() {
   if (sum != got) { safePrintln("CHECKSUM FAIL"); return; }
   ControlPacket pkt; memcpy(&pkt, rxBuf, sizeof(pkt));
   if (pkt.frequency > 0) {
-    sweepActive = false;                       // стрим НЕ останавливаем
+    if (sweepActive) { sweepActive = false; safePrintln("SWEEP: stopped"); }
     tipDef_2.CP   = pkt.cp_current & 0xF;
     tipDef_4.APWR = pkt.output_power & 3;
     tipDef_5.LD   = pkt.ld_pin_mode & 3;
@@ -146,7 +191,7 @@ static void handlePacket() {
                   + " CP=" + String(pkt.cp_current) + " -> " + (checkLockStatus() ? "LOCKED" : "UNLOCKED"));
     } else safePrintln("FREQ OUT OF RANGE");
   } else {
-    scopeOn = true; lastFrameMs = 0;           // первый кадр сразу
+    scopeOn = true; lastFrameMs = 0;
     safePrintln(">>> SCOPE ON (burst)");
   }
 }
@@ -161,9 +206,10 @@ void setup() {
   SPI.setFrequency(1000000); SPI.setDataMode(SPI_MODE0); SPI.setBitOrder(MSBFIRST);
   analogReadResolution(12);
   analogSetPinAttenuation(ADC_PIN, ADC_11db);
+  measureAdcSpeed();
   defaultSet();
   if (setFrequency(1000.0)) applySettings(true);
-  safePrintln("=== MAX2870 PRODUCTION (burst scope + sweep) ===");
+  safePrintln("=== MAX2870 PRODUCTION (burst scope + Goertzel sweep) ===");
 }
 
 void loop() {
@@ -176,7 +222,7 @@ void loop() {
       if (b == PACKET_HEADER) { rxBuf[0] = b; rxIdx = 1; }
       else if (b == '\n') {
         if (textBuf.length()) {
-          if (textBuf.startsWith("SCOPE_CFG:")) {           // SCOPE_CFG:fs,N,period
+          if (textBuf.startsWith("SCOPE_CFG:")) {
             String s = textBuf.substring(10);
             int c1 = s.indexOf(','), c2 = s.indexOf(',', c1 + 1);
             if (c1 > 0 && c2 > c1) {
@@ -184,9 +230,13 @@ void loop() {
               int n = s.substring(c1 + 1, c2).toInt();
               int p = s.substring(c2 + 1).toInt();
               if (fs >= 1000 && fs <= 100000 && n >= 20 && n <= SNAP_MAX && p >= 20 && p <= 2000) {
+                uint32_t maxFs = 1000000UL / adcUsPerSample;
+                uint32_t allowed = (uint32_t)(maxFs * 0.8);
+                if (fs > allowed) fs = allowed;
                 snapFs = fs; snapN = n; snapPeriod = p;
                 safePrintln("SCOPE_CFG ok: fs=" + String(snapFs) + " N=" + String(snapN) + " T=" + String(snapPeriod)
-                            + " load=" + String((int)(snapN * 2 * 1000 / snapPeriod)) + " B/s");
+                            + " load=" + String((int)(snapN * 2 * 1000 / snapPeriod)) + " B/s"
+                            + " adc_us=" + String(adcUsPerSample) + " max_fs=" + String(maxFs));
               } else safePrintln("SCOPE_CFG bad range");
             }
           }
@@ -203,13 +253,40 @@ void loop() {
                 bestL = -1; bestF = a;
                 sweepActive = true; sweepPhase = 0; sweepPhaseStart = millis();
                 setFrequency(sweepCur + SWEEP_IF_HZ / 1000000.0f); applySettings(false);
-                safePrintln("SWEEP: started " + String(a, 2) + "->" + String(bnd, 2) + " MHz");
+                safePrintln("SWEEP: started " + String(a, 3) + "->" + String(bnd, 3) + " MHz, step " + String(stk) + " kHz");
               }
             }
           }
           else if (textBuf.startsWith("SWEEP_STOP")) { sweepActive = false; safePrintln("SWEEP: stopped"); }
           else if (textBuf.startsWith("CP:"))  { int v = textBuf.substring(3).toInt(); if (v >= 0 && v <= 15) { tipDef_2.CP = v; applySettings(true); safePrintln("CP set to " + String(v)); } }
           else if (textBuf.startsWith("SDN:")) { int v = textBuf.substring(4).toInt(); if (v >= 0 && v <= 3)  { tipDef_2.SDN = v; applySettings(true); safePrintln("SDN set to " + String(v)); } }
+          else if (textBuf.startsWith("ADC_BENCH")) {
+            uint32_t interval = 1000000UL / snapFs;
+            uint32_t t1 = micros();
+            for (int i = 0; i < 100; i++) analogRead(ADC_PIN);
+            uint32_t perSample = (micros() - t1) / 100;
+            if (perSample == 0) perSample = 1;
+
+            uint16_t mn = 4095, mx = 0;
+            uint32_t t0 = micros();
+            for (uint16_t i = 0; i < snapN; i++) {
+              while ((uint32_t)(micros() - t0) < (uint32_t)i * interval) { }
+              uint16_t v = analogRead(ADC_PIN);
+              if (v < mn) mn = v;
+              if (v > mx) mx = v;
+            }
+            uint32_t dur = micros() - t0;
+            if (dur == 0) dur = 1;
+            uint32_t realFs = (uint32_t)((uint64_t)snapN * 1000000ULL / dur);
+
+            safePrintln("ADC_BENCH: us_per_sample=" + String(perSample)
+                        + " max_fs=" + String(1000000UL / perSample)
+                        + " | N=" + String(snapN)
+                        + " dur_us=" + String(dur)
+                        + " expect_us=" + String((uint32_t)snapN * interval)
+                        + " real_fs=" + String(realFs)
+                        + " | min=" + String(mn) + " max=" + String(mx));
+          }
           else { float f = textBuf.toFloat(); if (f > 0 && setFrequency(f)) { sweepActive = false; applySettings(true); safePrintln("TXT freq updated"); } }
           textBuf = "";
         }
@@ -221,23 +298,27 @@ void loop() {
     if (rxIdx == CTRL_SIZE) { rxIdx = 0; handlePacket(); }
   }
 
-  // --- Sweep ---
+  // --- Sweep (Goertzel, неблокирующий) ---
   if (sweepActive) {
     if (sweepPhase == 0) {
-      if (millis() - sweepPhaseStart >= SWEEP_SETTLE_MS) { sweepPhase = 1; sweepPhaseStart = millis(); sweepMin = 4095; sweepMax = 0; }
+      if (millis() - sweepPhaseStart >= SWEEP_SETTLE_MS) {
+        sweepPhase = 1; measIdx = 0; measNextUs = micros();
+      }
     } else {
-      int v = analogRead(ADC_PIN);
-      if (v < sweepMin) sweepMin = v;
-      if (v > sweepMax) sweepMax = v;
-      if (millis() - sweepPhaseStart >= SWEEP_MEASURE_MS) {
-        int level = sweepMax - sweepMin;
+      if (measIdx < SWEEP_MEAS_N) {
+        if ((int32_t)(micros() - measNextUs) >= 0) {
+          measBuf[measIdx++] = analogRead(ADC_PIN);
+          measNextUs += 1000000UL / SWEEP_MEAS_FS;
+        }
+      } else {
+        int level = goertzelLevel();
         if (level > bestL) { bestL = level; bestF = sweepCur; }
-        safePrintln("SCAN_RESULT:" + String(sweepCur, 3) + "," + String(level));
+        safePrintln("SCAN_RESULT:" + String(sweepCur, 4) + "," + String(level));
         sweepCur += sweepStep;
-        if (sweepCur > sweepStopF + 1e-6) {
+        if (sweepCur > sweepStopF + 1e-7) {
           sweepActive = false;
           safePrintln("SWEEP: done");
-          safePrintln("SWEEP_PEAK:" + String(bestF, 3) + "," + String(bestL));
+          safePrintln("SWEEP_PEAK:" + String(bestF, 4) + "," + String(bestL));
         } else {
           setFrequency(sweepCur + SWEEP_IF_HZ / 1000000.0f); applySettings(false);
           sweepPhase = 0; sweepPhaseStart = millis();
@@ -246,7 +327,7 @@ void loop() {
     }
   }
 
-  // --- Burst scope: один кадр раз в snapPeriod мс ---
+  // --- Burst scope ---
   if (scopeOn && !sweepActive && (millis() - lastFrameMs >= snapPeriod)) {
     lastFrameMs = millis();
     captureFrame();
