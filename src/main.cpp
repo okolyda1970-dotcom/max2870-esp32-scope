@@ -137,14 +137,14 @@ static void captureFrame() {
   sendFrameChunked(snapPkt, 2 + snapN * 2);
 }
 
-// ================= SWEEP (Goertzel — частотно-избирательный) =================
+// ================= SWEEP =================
 #define SWEEP_SETTLE_MS   25
 #define SWEEP_MEAS_FS     8000
 #define SWEEP_MEAS_N      64
 #define SWEEP_IF_HZ       200.0f
 
 static bool sweepActive = false;
-static uint8_t sweepPhase = 0;              // 0 = пауза на захват, 1 = замер
+static uint8_t sweepPhase = 0;
 static float sweepCur = 0, sweepStopF = 0, sweepStep = 0;
 static unsigned long sweepPhaseStart = 0;
 static uint16_t measBuf[SWEEP_MEAS_N];
@@ -165,6 +165,34 @@ static int goertzelLevel() {
   double power = s1 * s1 + s2 * s2 - coeff * s1 * s2;
   if (power < 0) power = 0;
   return (int)(sqrt(power) * 2.0 / SWEEP_MEAS_N);
+}
+
+static int peakPeakLevel() {
+  uint16_t mn = 4095, mx = 0;
+  for (int i = 0; i < SWEEP_MEAS_N; i++) {
+    if (measBuf[i] < mn) mn = measBuf[i];
+    if (measBuf[i] > mx) mx = measBuf[i];
+  }
+  return mx - mn;
+}
+
+// ================= MONITOR: уровень на фиксированной частоте =================
+#define MON_N        64
+#define MON_FS       8000
+#define MON_SEND_MS  50          // 20 отсчётов в секунду
+static bool monActive = false;
+static uint16_t monBuf[MON_N];
+static uint16_t monIdx = 0;
+static uint32_t monNextUs = 0;
+static unsigned long monLastSend = 0;
+
+static int monitorRms() {
+  long sum = 0;
+  for (int i = 0; i < MON_N; i++) sum += monBuf[i];
+  double mean = sum / (double)MON_N;
+  double acc = 0;
+  for (int i = 0; i < MON_N; i++) { double d = monBuf[i] - mean; acc += d * d; }
+  return (int)sqrt(acc / MON_N);
 }
 
 // ================= протокол =================
@@ -191,6 +219,7 @@ static void handlePacket() {
                   + " CP=" + String(pkt.cp_current) + " -> " + (checkLockStatus() ? "LOCKED" : "UNLOCKED"));
     } else safePrintln("FREQ OUT OF RANGE");
   } else {
+    monActive = false;
     scopeOn = true; lastFrameMs = 0;
     safePrintln(">>> SCOPE ON (burst)");
   }
@@ -209,7 +238,7 @@ void setup() {
   measureAdcSpeed();
   defaultSet();
   if (setFrequency(1000.0)) applySettings(true);
-  safePrintln("=== MAX2870 PRODUCTION (burst scope + Goertzel sweep) ===");
+  safePrintln("=== MAX2870 PRODUCTION (scope + sweep + level monitor) ===");
 }
 
 void loop() {
@@ -217,7 +246,11 @@ void loop() {
   while (Serial.available()) {
     uint8_t b = (uint8_t)Serial.read();
     lastByteMs = millis();
-    if (b == STOP_HEADER) { rxIdx = 0; textBuf = ""; scopeOn = false; sweepActive = false; safePrintln(">>> STOP"); continue; }
+    if (b == STOP_HEADER) {
+      rxIdx = 0; textBuf = "";
+      scopeOn = false; sweepActive = false; monActive = false;
+      safePrintln(">>> STOP"); continue;
+    }
     if (rxIdx == 0) {
       if (b == PACKET_HEADER) { rxBuf[0] = b; rxIdx = 1; }
       else if (b == '\n') {
@@ -248,16 +281,24 @@ void loop() {
               float bnd = s.substring(c1 + 1, c2).toFloat();
               float stk = s.substring(c2 + 1).toFloat();
               if (a > 0 && bnd >= a && stk > 0) {
-                scopeOn = false;
+                scopeOn = false; monActive = false;
                 sweepCur = a; sweepStopF = bnd; sweepStep = stk / 1000.0f;
                 bestL = -1; bestF = a;
                 sweepActive = true; sweepPhase = 0; sweepPhaseStart = millis();
                 setFrequency(sweepCur + SWEEP_IF_HZ / 1000000.0f); applySettings(false);
-                safePrintln("SWEEP: started " + String(a, 3) + "->" + String(bnd, 3) + " MHz, step " + String(stk) + " kHz");
+                safePrintln("SWEEP: started " + String(a, 3) + "->" + String(bnd, 3)
+                            + " MHz, step " + String(stk) + " kHz, det="
+                            + (sweepStep > 0.0005f ? "pp" : "goertzel"));
               }
             }
           }
           else if (textBuf.startsWith("SWEEP_STOP")) { sweepActive = false; safePrintln("SWEEP: stopped"); }
+          else if (textBuf.startsWith("MONITOR_START")) {
+            scopeOn = false; sweepActive = false;
+            monActive = true; monIdx = 0; monNextUs = micros(); monLastSend = 0;
+            safePrintln("MONITOR: started");
+          }
+          else if (textBuf.startsWith("MONITOR_STOP")) { monActive = false; safePrintln("MONITOR: stopped"); }
           else if (textBuf.startsWith("CP:"))  { int v = textBuf.substring(3).toInt(); if (v >= 0 && v <= 15) { tipDef_2.CP = v; applySettings(true); safePrintln("CP set to " + String(v)); } }
           else if (textBuf.startsWith("SDN:")) { int v = textBuf.substring(4).toInt(); if (v >= 0 && v <= 3)  { tipDef_2.SDN = v; applySettings(true); safePrintln("SDN set to " + String(v)); } }
           else if (textBuf.startsWith("ADC_BENCH")) {
@@ -266,7 +307,6 @@ void loop() {
             for (int i = 0; i < 100; i++) analogRead(ADC_PIN);
             uint32_t perSample = (micros() - t1) / 100;
             if (perSample == 0) perSample = 1;
-
             uint16_t mn = 4095, mx = 0;
             uint32_t t0 = micros();
             for (uint16_t i = 0; i < snapN; i++) {
@@ -278,11 +318,9 @@ void loop() {
             uint32_t dur = micros() - t0;
             if (dur == 0) dur = 1;
             uint32_t realFs = (uint32_t)((uint64_t)snapN * 1000000ULL / dur);
-
             safePrintln("ADC_BENCH: us_per_sample=" + String(perSample)
                         + " max_fs=" + String(1000000UL / perSample)
-                        + " | N=" + String(snapN)
-                        + " dur_us=" + String(dur)
+                        + " | N=" + String(snapN) + " dur_us=" + String(dur)
                         + " expect_us=" + String((uint32_t)snapN * interval)
                         + " real_fs=" + String(realFs)
                         + " | min=" + String(mn) + " max=" + String(mx));
@@ -298,7 +336,7 @@ void loop() {
     if (rxIdx == CTRL_SIZE) { rxIdx = 0; handlePacket(); }
   }
 
-  // --- Sweep (Goertzel, неблокирующий) ---
+  // --- Sweep ---
   if (sweepActive) {
     if (sweepPhase == 0) {
       if (millis() - sweepPhaseStart >= SWEEP_SETTLE_MS) {
@@ -311,7 +349,7 @@ void loop() {
           measNextUs += 1000000UL / SWEEP_MEAS_FS;
         }
       } else {
-        int level = goertzelLevel();
+        int level = (sweepStep > 0.0005f) ? peakPeakLevel() : goertzelLevel();
         if (level > bestL) { bestL = level; bestF = sweepCur; }
         safePrintln("SCAN_RESULT:" + String(sweepCur, 4) + "," + String(level));
         sweepCur += sweepStep;
@@ -327,19 +365,39 @@ void loop() {
     }
   }
 
+  // --- Level monitor ---
+  if (monActive) {
+    if (monIdx < MON_N) {
+      if ((int32_t)(micros() - monNextUs) >= 0) {
+        monBuf[monIdx++] = analogRead(ADC_PIN);
+        monNextUs += 1000000UL / MON_FS;
+      }
+    } else {
+      if (millis() - monLastSend >= MON_SEND_MS) {
+        monLastSend = millis();
+        safePrintln("LEVEL:" + String(monitorRms()));
+      }
+      monIdx = 0;
+    }
+  }
+
   // --- Burst scope ---
-  if (scopeOn && !sweepActive && (millis() - lastFrameMs >= snapPeriod)) {
+  if (scopeOn && !sweepActive && !monActive && (millis() - lastFrameMs >= snapPeriod)) {
     lastFrameMs = millis();
     captureFrame();
   }
 
   // --- статус ---
   static unsigned long t = 0;
-  if (millis() - t > 500) { t = millis(); digitalWrite(STATUS_LED, checkLockStatus() ? HIGH : LOW); }
+  if (millis() - t > 500) {
+    t = millis();
+    if (monActive) digitalWrite(STATUS_LED, digitalRead(MUX_PIN));
+    else digitalWrite(STATUS_LED, checkLockStatus() ? HIGH : LOW);
+  }
   static unsigned long p = 0;
   if (millis() - p > 1000) {
     p = millis();
-    if (!scopeOn && !sweepActive) {
+    if (!scopeOn && !sweepActive && !monActive) {
       if (digitalRead(STATUS_LED) == HIGH) safePrintln(".");
       else safePrintln("WARNING: UNLOCKED!");
     }
